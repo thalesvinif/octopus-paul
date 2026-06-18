@@ -15,8 +15,7 @@ from datetime import datetime
 
 import click
 
-from .api_football import get_client, WC_SEASON
-from .elo_loader import load_elo_csv
+from .football_data import get_client as get_football_data_client
 
 DB_PATH = os.getenv("DB_PATH", "./copa.db")
 
@@ -120,6 +119,104 @@ def _upsert_stats(con: sqlite3.Connection, fixture_id: int, stats_response: list
         )
 
 
+def _football_data_status(status: str) -> str:
+    return {
+        "FINISHED": "FT",
+        "IN_PLAY": "1H",
+        "PAUSED": "HT",
+        "TIMED": "NS",
+        "SCHEDULED": "NS",
+        "POSTPONED": "PST",
+        "SUSPENDED": "SUSP",
+        "CANCELLED": "CANC",
+    }.get(status, status)
+
+
+def _upsert_football_data_team(
+    con: sqlite3.Connection, team: dict, is_wc2026: int = 1
+) -> None:
+    if not team.get("id"):
+        return
+    con.execute(
+        """INSERT INTO teams (id, name, code, country, flag_url, is_wc2026)
+           VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             name = excluded.name,
+             code = COALESCE(excluded.code, teams.code),
+             country = COALESCE(excluded.country, teams.country),
+             flag_url = COALESCE(excluded.flag_url, teams.flag_url),
+             is_wc2026 = MAX(teams.is_wc2026, excluded.is_wc2026)""",
+        (
+            team["id"],
+            team.get("name") or team.get("shortName") or team.get("tla"),
+            team.get("tla"),
+            team.get("area", {}).get("name") or team.get("name"),
+            team.get("crest"),
+            is_wc2026,
+        ),
+    )
+
+
+def _upsert_football_data_fixture(con: sqlite3.Connection, match: dict) -> bool:
+    home = match.get("homeTeam") or {}
+    away = match.get("awayTeam") or {}
+    if not home.get("id") or not away.get("id"):
+        return False
+
+    _upsert_football_data_team(con, home, is_wc2026=1)
+    _upsert_football_data_team(con, away, is_wc2026=1)
+
+    score = match.get("score") or {}
+    full_time = score.get("fullTime") or {}
+    half_time = score.get("halfTime") or {}
+    season = match.get("season") or {}
+    competition = match.get("competition") or {}
+    group = match.get("group")
+    stage = match.get("stage")
+    matchday = match.get("matchday")
+    round_name = group or stage
+    if matchday and round_name:
+        round_name = f"{round_name} - Matchday {matchday}"
+
+    con.execute(
+        """INSERT INTO fixtures (
+              id, league_id, season, round, date_utc, venue_city, venue_country,
+              is_neutral, status, home_team_id, away_team_id,
+              home_goals, away_goals, home_goals_ht, away_goals_ht, is_wc2026
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+             round = excluded.round,
+             date_utc = excluded.date_utc,
+             status = excluded.status,
+             home_team_id = excluded.home_team_id,
+             away_team_id = excluded.away_team_id,
+             home_goals = excluded.home_goals,
+             away_goals = excluded.away_goals,
+             home_goals_ht = excluded.home_goals_ht,
+             away_goals_ht = excluded.away_goals_ht,
+             is_wc2026 = excluded.is_wc2026""",
+        (
+            match["id"],
+            competition.get("id", 2000),
+            int(season.get("startDate", "2026")[:4]),
+            round_name,
+            match["utcDate"],
+            None,
+            None,
+            1,
+            _football_data_status(match.get("status", "")),
+            home["id"],
+            away["id"],
+            full_time.get("home"),
+            full_time.get("away"),
+            half_time.get("home"),
+            half_time.get("away"),
+            1,
+        ),
+    )
+    return True
+
+
 # ----------------------------------------------------------------------
 # CLI
 # ----------------------------------------------------------------------
@@ -131,6 +228,8 @@ def cli():
 @cli.command("world-cup")
 def ingest_wc():
     """Ingest WC2026 fixtures and stats from finished matches."""
+    from .api_football import get_client
+
     client = get_client()
     fixtures = client.fixtures_world_cup()
     click.echo(f"Found {len(fixtures)} WC2026 fixtures")
@@ -156,10 +255,64 @@ def ingest_wc():
     click.echo("✓ World Cup ingest complete")
 
 
+def refresh_world_cup_results(replace: bool = False) -> dict:
+    """Pull WC2026 fixtures/scores from football-data.org into SQLite.
+
+    Reusable by both the CLI and the API. Returns a summary dict.
+    """
+    client = get_football_data_client()
+    teams = client.world_cup_teams()
+    matches = client.world_cup_matches()
+
+    with sqlite3.connect(DB_PATH) as con:
+        if replace:
+            con.execute(
+                """DELETE FROM match_stats
+                   WHERE fixture_id IN (SELECT id FROM fixtures WHERE is_wc2026 = 1)"""
+            )
+            con.execute("DELETE FROM fixtures WHERE is_wc2026 = 1")
+            con.execute("UPDATE teams SET is_wc2026 = 0 WHERE is_wc2026 = 1")
+
+        for team in teams:
+            _upsert_football_data_team(con, team, is_wc2026=1)
+
+        inserted = 0
+        skipped = 0
+        finished = 0
+        for match in matches:
+            if _upsert_football_data_fixture(con, match):
+                inserted += 1
+                if match.get("status") == "FINISHED":
+                    finished += 1
+            else:
+                skipped += 1
+
+    return {
+        "teams": len(teams),
+        "fixtures": inserted,
+        "finished": finished,
+        "skipped": skipped,
+    }
+
+
+@cli.command("world-cup-football-data")
+@click.option("--replace", is_flag=True, help="Delete existing WC2026 fixtures first")
+def ingest_wc_football_data(replace: bool):
+    """Ingest WC2026 fixtures and scores from football-data.org."""
+    r = refresh_world_cup_results(replace=replace)
+    click.echo(f"Found {r['teams']} WC2026 teams")
+    click.echo(
+        f"✓ football-data.org ingest complete: {r['fixtures']} fixtures, "
+        f"{r['finished']} finished, {r['skipped']} unresolved knockout placeholders skipped"
+    )
+
+
 @cli.command("history")
 @click.option("--years", default=5, help="Number of past years to pull per team")
 def ingest_history(years: int):
     """Ingest historical fixtures for every WC2026 team."""
+    from .api_football import get_client
+
     client = get_client()
     with sqlite3.connect(DB_PATH) as con:
         teams = con.execute(
@@ -187,6 +340,8 @@ def ingest_history(years: int):
 @click.option("--csv", "csv_path", required=True, help="Path to Elo CSV file")
 def ingest_elo(csv_path: str):
     """Load Elo ratings CSV into the database."""
+    from .elo_loader import load_elo_csv
+
     n = load_elo_csv(csv_path)
     click.echo(f"✓ Loaded {n} Elo rows")
 
