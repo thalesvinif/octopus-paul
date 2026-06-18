@@ -1,131 +1,205 @@
 # Copa Predictor 2026
 
-Aplicação para sugerir resultados da Copa do Mundo 2026 com **dois modelos paralelos**:
+Aplicação full-stack para prever resultados da Copa do Mundo de 2026 com **dois
+modelos paralelos**, uma **API FastAPI** e uma **interface web em Next.js**.
 
-- **Modelo A — Histórico**: usa todos os dados disponíveis de cada seleção (Elo, forma últimos N jogos, H2H, descanso)
-- **Modelo B — Tournament-only**: usa apenas resultados durante a própria Copa 2026, com Bayesian shrinkage para um prior derivado do Elo pré-torneio
+- **Modelo A — Histórico** 📚: usa a "ficha" de cada seleção — ranking de força
+  (Elo), forma recente (gols feitos/sofridos nos últimos jogos), histórico de
+  confrontos diretos (H2H) e descanso. Funciona desde o 1º jogo. *(= reputação)*
+- **Modelo B — Só esta Copa** 🔥: ignora o passado e usa **apenas** os resultados
+  da própria Copa 2026, com atualização Bayesiana sobre um *prior* derivado do Elo
+  pré-torneio. Começa quase só com o ranking e fica mais preciso a cada rodada.
+  *(= fase atual no torneio)*
 
-Ambos os modelos retornam:
-- Placar esperado (gols esperados de cada time)
-- Distribuição de placares (probabilidade de cada combinação 0-6 × 0-6)
-- Probabilidades W/D/L
-- Resultado mais provável
+Ambos devolvem: gols esperados de cada lado, distribuição de placares (matriz
+0–7 × 0–7), probabilidades de vitória/empate/derrota e o placar mais provável.
 
-## Stack de dados
+> A Copa é em **campo neutro**: os modelos não aplicam vantagem de mando. O Modelo A
+> é simetrizado (inverter a ordem dos times espelha o resultado exatamente).
 
-| Fonte | Uso | Custo |
-|---|---|---|
-| API-Football (api-sports.io) | Fixtures, eventos, stats, escalações, H2H | Free 100 req/dia |
-| openfootball/worldcup.json | Schedule estático + fallback | Grátis (GitHub) |
-| Elo Ratings (eloratings.net via Kaggle) | Feature preditiva mais forte | Grátis (CC BY-SA 4.0) |
+---
+
+## Arquitetura
+
+```
+┌──────────────────┐     HTTP/JSON      ┌─────────────────────┐
+│  web/ (Next.js)  │ ─────────────────▶ │  src/api.py (FastAPI)│
+│  React + Tailwind│                    │  + agendador horário │
+└──────────────────┘                    └──────────┬──────────┘
+                                                    │
+                              ┌─────────────────────┼─────────────────────┐
+                              ▼                     ▼                     ▼
+                        copa.db (SQLite)     modelos (A/B)        football-data.org
+                                                                  + API-Football
+```
+
+```
+src/
+├── api.py            # API FastAPI (endpoints + auto-refresh + monitoramento)
+├── api_football.py   # Cliente API-Football (histórico)
+├── football_data.py  # Cliente football-data.org (fixtures/resultados da Copa)
+├── elo_loader.py     # Carrega o CSV de Elo
+├── ingest.py         # ETL: APIs → SQLite (+ refresh dos resultados)
+├── features.py       # Feature engineering (Modelo A e estado do Modelo B)
+├── models.py         # Poisson GLM (A) + Bayesian Gamma-Poisson (B)
+├── monitor.py        # Backtest, log diário de métricas, gatilho de recalibração
+├── teams.py          # Resolução de nomes/códigos de seleção
+└── predict.py        # CLI de predição
+web/                  # Front-end Next.js (App Router, shadcn/ui, recharts)
+schema.sql            # Schema do SQLite
+backtest.py           # Backtest jogo a jogo (sem vazamento) na linha de comando
+```
+
+---
 
 ## Setup
+
+### 1. Backend (Python 3.10+)
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env  # adicionar API_FOOTBALL_KEY
-sqlite3 copa.db < schema.sql
+cp .env.example .env          # preencha as chaves (veja abaixo)
+sqlite3 copa.db < schema.sql  # cria o banco
 ```
 
-## Obtendo a chave da API
+**Chaves (`.env`):**
+- `API_FOOTBALL_KEY` — conta grátis em [dashboard.api-football.com](https://dashboard.api-football.com) (100 req/dia), para o histórico.
+- `FOOTBALL_DATA_TOKEN` — conta grátis em [football-data.org](https://www.football-data.org), para fixtures/resultados da Copa.
 
-1. Acesse [dashboard.api-football.com](https://dashboard.api-football.com)
-2. Crie uma conta gratuita (100 req/dia)
-3. Copie a chave e cole no `.env`
+**CSV de Elo:** baixe o dataset [2026 FIFA World Cup Historical Elo Ratings](https://www.kaggle.com/datasets/afonsofernandescruz/2026-fifa-world-cup-historical-elo-ratings) e salve como `elo_ratings_wc2026.csv`.
 
-## Obtendo o CSV de Elo
+**Popular o banco:**
+```bash
+python -m src.ingest world-cup-football-data   # times + fixtures + resultados da Copa
+python -m src.ingest history --years 5          # histórico de cada seleção
+python -m src.ingest elo --csv elo_ratings_wc2026.csv
+python -m src.models train-historical           # treina o Modelo A
+```
 
-1. Acesse o dataset no Kaggle: [2026 FIFA World Cup Historical Elo Ratings](https://www.kaggle.com/datasets/afonsofernandescruz/2026-fifa-world-cup-historical-elo-ratings)
-2. Baixe o CSV e salve como `elo_ratings_wc2026.csv`
+**Subir a API:**
+```bash
+uvicorn src.api:app --port 8010
+```
+Ao subir, a API faz um refresh dos resultados e grava um snapshot de métricas; depois repete de hora em hora (configurável em `REFRESH_INTERVAL_SECONDS`).
 
-## Uso
+### 2. Frontend (Node 20+)
 
 ```bash
-# 1. Cria o banco de dados
-sqlite3 copa.db < schema.sql
-
-# 2. Ingere os times e fixtures da Copa 2026
-python -m src.ingest world-cup
-
-# 3. Ingere histórico dos últimos 5 anos de cada seleção
-python -m src.ingest history --years 5
-
-# 4. Ingere Elo ratings
-python -m src.ingest elo --csv elo_ratings_wc2026.csv
-
-# 5. Treina o Modelo A (Histórico)
-python -m src.models train-historical
-
-# 6. Inspeciona estado do torneio (Modelo B)
-python -m src.models inspect-tournament
-
-# 7. Prediz um jogo com ambos os modelos
-python -m src.predict --home Brasil --away Argentina
+cd web
+npm install
+echo "NEXT_PUBLIC_API_URL=http://localhost:8010" > .env.local
+npm run dev        # http://localhost:3000
 ```
+> Se a porta 3000 estiver ocupada, use `npm run dev -- -p 3100` e ajuste a URL no navegador.
+> O `NEXT_PUBLIC_API_URL` aponta o front para a API.
 
-### Exemplo de output
+---
 
-```
-───────────── Brasil × Argentina  (2026-06-26) ─────────────
+## A interface (e os botões)
 
-         Modelo A — Histórico
-  ┌────────────────────────────┬──────────────────┐
-  │ Gols esperados (casa)      │ 1.84             │
-  │ Gols esperados (visit.)    │ 1.12             │
-  │ Placar mais provável       │ 2 × 1  (8.4%)   │
-  │ P(vitória casa)            │ 52.1%            │
-  │ P(empate)                  │ 24.3%            │
-  │ P(vitória visit.)          │ 23.6%            │
-  └────────────────────────────┴──────────────────┘
+| Página | O que mostra |
+|---|---|
+| **Início** (`/`) | Próximos jogos, resultados recentes e prévia da classificação |
+| **Previsão** (`/predict`) | Escolha duas seleções e clique em **Prever** — mostra os **dois modelos lado a lado** com gols esperados, barra de probabilidades W/D/L, matriz de placares e os **dados usados** na conta |
+| **Jogos** (`/fixtures`) | Todos os jogos, filtráveis por status/grupo; cada um abre a previsão |
+| **Grupos** (`/groups`) | Classificação dos grupos calculada dos jogos encerrados |
+| **Time** (`/teams/[id]`) | Elo, forma, desempenho no torneio e jogos da seleção |
+| **Monitor** (`/monitor`) | Desempenho dos modelos nos jogos já disputados + gatilho de recalibração |
 
-         Modelo B — Apenas Copa 2026
-  ┌────────────────────────────┬──────────────────────────────────┐
-  │ Gols esperados (casa)      │ 1.66                             │
-  │ Gols esperados (visit.)    │ 1.31                             │
-  │ Placar mais provável       │ 1 × 1  (9.1%)                   │
-  │ P(vitória casa)            │ 44.8%                            │
-  │ P(empate)                  │ 26.1%                            │
-  │ P(vitória visit.)          │ 29.1%                            │
-  │ Notas                      │ baseado em 3 jogos do BRA e 3... │
-  └────────────────────────────┴──────────────────────────────────┘
-```
+### Botões
+- **Atualizar** (barra superior, em todas as páginas) — chama `POST /api/refresh`,
+  re-puxa os resultados do football-data.org e atualiza a página. Útil logo
+  após um jogo terminar (o auto-refresh horário já faz isso sozinho; o botão força na hora).
+- **Rodar agora** (página Monitor) — chama `POST /api/monitor/run`, roda o backtest
+  sobre os jogos encerrados e grava um snapshot de métricas do dia.
+- **Tema** (ícone sol/lua) — alterna claro/escuro.
 
-## Estrutura
-
-```
-src/
-├── api_football.py   # Cliente da API com cache em SQLite
-├── elo_loader.py     # Carrega CSV de Elo ratings
-├── ingest.py         # ETL: API → SQLite
-├── features.py       # Feature engineering (Modelo A e B)
-├── models.py         # Poisson GLM + Bayesian Gamma-Poisson
-└── predict.py        # CLI de predição
-schema.sql            # Schema do banco SQLite
-requirements.txt      # Dependências Python
-```
+---
 
 ## Como os modelos funcionam
 
-**Modelo A** treina em jogos internacionais 2020-2025 (~3000 partidas). Usa Poisson regression bivariada:
-```
-log(λ_home) = β₀ + β₁·elo_diff + β₂·form_home + β₃·form_away + β₄·h2h + β₅·rest
-log(λ_away) = β₀' + ...
-```
-Depois aplica produto cartesiano de Poisson para gerar matriz de placares 8×8.
+### Modelo A — Histórico (Poisson GLM)
+Treina em jogos internacionais desde 2020 (~800 partidas). Duas regressões de
+Poisson (gols do mandante e do visitante) sobre as features:
+`elo_diff`, forma ofensiva/defensiva (últimos 10), `h2h`, descanso.
+A matriz de placares é o produto das duas distribuições de Poisson.
+Como a Copa é neutra, a previsão é **simetrizada** (média das duas ordens).
 
-**Modelo B** mantém para cada time uma estimativa Bayesiana de força ofensiva/defensiva:
+### Modelo B — Só Copa 2026 (Bayesian Gamma-Poisson)
+Cada seleção tem ataque/defesa estimados:
 ```
-prior:  α ~ Gamma(k₀, θ₀)  derivado do Elo pré-Copa
-likelihood: goals | α ~ Poisson(α)
-posterior: Gamma(k₀ + Σgoals, θ₀ + n)
+prior:      derivado do Elo pré-Copa, em torno de 1,35 gol/time
+posterior:  (prior + gols na Copa) / (3 + nº de jogos na Copa)
 ```
-No início da Copa o posterior fica próximo do prior. Conforme a Copa avança, os dados do torneio dominam.
+No início o posterior ≈ prior (quase só Elo). Após ~3 jogos, os dados do torneio
+dominam. Os gols esperados combinam ataque de um × defesa do outro.
+
+### Sobre empates e calibração (decisões honestas)
+- A matriz tem infraestrutura de correção **Dixon-Coles** (`rho`) e de **inflação de
+  empate** (`draw_boost`), ambas **desligadas** (`rho=0`, `draw_boost=1.0`).
+- Motivo: calibração out-of-sample em ~800 jogos reais mostrou que o **Poisson
+  independente já acerta a taxa de empate** (~21% previsto vs ~21% real) e qualquer
+  inflação **piora** as métricas. Os ~40% de empate nos primeiros jogos da Copa
+  são ruído de amostra pequena — calibrar nisso seria overfitting.
+- O `argmax` (escolher o resultado mais provável) raramente aponta "empate", mesmo
+  com a probabilidade calibrada, porque empate é uma diagonal fina disputando
+  contra dois triângulos inteiros de placares de vitória. Por isso as **métricas de
+  probabilidade (RPS, Brier, log-loss)** avaliam melhor que o acerto do `argmax`.
+
+---
+
+## Monitoramento e gatilho de recalibração
+
+A página **Monitor** roda um **backtest sem vazamento** (Modelo A retreinado
+*excluindo* os jogos da Copa) sobre todas as partidas encerradas e registra um
+**snapshot por dia** em `metrics_log.csv`: acerto 1X2, placar exato, Brier, RPS,
+log-loss, taxa de empate (real e prevista), nº de jogos.
+
+O **gatilho de recalibração** (banner verde/amarelo/vermelho) só sugere mexer na
+matemática quando **dois critérios** valem juntos — e a decisão é **humana**:
+1. **amostra suficiente** (`≥ 72` jogos, ~fim da fase de grupos);
+2. **desvio de empate significativo e persistente** (`|z| ≥ 2` por ≥ 5 snapshots).
+
+Isso evita o erro de re-calibrar a cada ruído de poucos jogos.
+
+```bash
+python backtest.py        # backtest jogo a jogo no terminal
+python -m src.monitor     # grava o snapshot do dia e imprime o status do gatilho
+```
+
+---
+
+## API (principais endpoints)
+
+| Método | Rota | Descrição |
+|---|---|---|
+| `GET` | `/api/teams` | Seleções da Copa 2026 |
+| `GET` | `/api/fixtures` | Jogos (filtros: `status`, `group`, `matchday`) |
+| `GET` | `/api/standings` | Classificação dos grupos |
+| `GET` | `/api/teams/{id}` | Detalhe de uma seleção |
+| `GET` | `/api/predict` | Previsão (`home`/`away` ou `fixture_id`; `historical=true` inclui o Modelo A) |
+| `GET` / `POST` | `/api/refresh` | Status / dispara o refresh dos resultados |
+| `GET` / `POST` | `/api/monitor/history` · `/api/monitor/run` | Histórico de métricas / roda o backtest |
+
+---
+
+## CLI de predição
+
+```bash
+python -m src.predict --home Brasil --away Argentina
+```
+
+## Stack
+
+| Camada | Tecnologias |
+|---|---|
+| Modelos/ETL | Python, statsmodels, SQLite |
+| API | FastAPI, Uvicorn |
+| Front-end | Next.js (App Router), React, Tailwind, shadcn/ui, recharts |
+| Dados | football-data.org, API-Football, Elo (Kaggle) |
 
 ## Próximos passos
-
-- [ ] Correção Dixon-Coles τ(x,y) para calibração em placares baixos
-- [ ] Decay exponencial por recência no Modelo A
-- [ ] Feature de xG sintético (shots × conversion rate)
-- [ ] Endpoint REST com FastAPI
-- [ ] Backtesting em Catar 2022 e Rússia 2018
+- [ ] Backtest sobre Catar 2022 e Rússia 2018 (exige fonte de dados que libere temporadas antigas)
+- [ ] Feature de xG sintético no Modelo A
+- [ ] Reavaliar Dixon-Coles/empate quando houver amostra grande e persistente (o gatilho avisa)
