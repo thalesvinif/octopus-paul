@@ -9,10 +9,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Iterable
-
-import pandas as pd
+from datetime import datetime
 
 from .elo_loader import all_latest_elo, latest_elo
 
@@ -155,15 +152,24 @@ def build_features_for_match(
     )
 
 
-def build_training_set(db_path: str = DB_PATH, since: str = "2020-01-01") -> pd.DataFrame:
-    """Build a training DataFrame from finished historical fixtures."""
+def build_training_set(
+    db_path: str = DB_PATH, since: str = "2020-01-01", exclude_wc2026: bool = False
+):
+    """Build a training DataFrame from finished historical fixtures.
+
+    Set exclude_wc2026=True for a leak-free backtest of the WC2026 matches
+    (otherwise those games are both trained on and tested).
+    """
+    import pandas as pd
+
     with sqlite3.connect(db_path) as con:
         fxs = con.execute(
-            """SELECT id, home_team_id, away_team_id, date_utc, home_goals, away_goals
+            f"""SELECT id, home_team_id, away_team_id, date_utc, home_goals, away_goals
                FROM fixtures
                WHERE status = 'FT'
                  AND home_goals IS NOT NULL
                  AND date_utc >= ?
+                 {"AND is_wc2026 = 0" if exclude_wc2026 else ""}
                ORDER BY date_utc""",
             (since,),
         ).fetchall()
