@@ -20,33 +20,48 @@ from __future__ import annotations
 import os
 import pickle
 import sqlite3
+import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
-
-import click
-import numpy as np
-import pandas as pd
-import statsmodels.api as sm
+from typing import Any, Literal
 
 from .features import (
     MatchFeatures,
     TournamentTeamState,
-    build_features_for_match,
     build_tournament_state,
-    build_training_set,
 )
-from .elo_loader import latest_elo
 
 DB_PATH = os.getenv("DB_PATH", "./copa.db")
 MODEL_PATH = Path("./models_artifacts")
 MODEL_PATH.mkdir(exist_ok=True)
 MAX_GOALS = 7  # truncate score matrix at 7-7
 
+# Draw inflation knob: multiplies every i-i scoreline before renormalizing.
+# Left OFF (1.0). Out-of-sample calibration on ~800 real internationals
+# (2020-25, temporal 80/20 split) showed the independent Poisson already nails
+# the draw rate — it predicted 21.3% draws vs 20.6% observed — and every score
+# (Brier/RPS/log-loss) was best at 1.0 and got worse as the boost rose. The 39%
+# draw rate in the first 23 WC2026 games was small-sample noise; tuning to it
+# overfits. The knob stays here to re-test if a real, larger draw skew shows up.
+#
+# Experiment (NOT applied): fitting scale+boost purely to those 23 WC games
+# maxes out at 11/23 correct (vs 10/23 at 1.0), and only by halving expected
+# goals (scale ~0.5) + boost 1.2 (Modelo A) / 1.8 (Modelo B) — a clear overfit
+# that would generalize worse. Kept at 1.0 by choice.
+DRAW_BOOST = 1.0
+
 
 # ======================================================================
 # Shared utilities
 # ======================================================================
+@dataclass
+class FeatureRow:
+    """One input value shown for transparency. `away` is None for single values."""
+    label: str
+    home: float | str | None
+    away: float | str | None = None
+
+
 @dataclass
 class Prediction:
     model: Literal["historical", "tournament"]
@@ -56,31 +71,94 @@ class Prediction:
     p_draw: float
     p_away_win: float
     most_likely: tuple[int, int, float]
-    score_matrix: np.ndarray
+    score_matrix: list[list[float]]
     notes: str = ""
+    features: list[FeatureRow] | None = None
 
 
-def _poisson_matrix(lambda_home: float, lambda_away: float) -> np.ndarray:
-    """Independent bivariate Poisson — outer product of two Poisson PMFs.
+def _poisson_pmf(lam: float, max_goals: int = MAX_GOALS) -> list[float]:
+    values = []
+    for goals in range(max_goals + 1):
+        values.append(math.exp(-lam) * (lam ** goals) / math.factorial(goals))
+    return values
 
-    Simple version. For better calibration on low scores, plug in the
-    Dixon-Coles τ(x,y,λ,μ,ρ) correction here.
+
+def _dc_tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
+    """Dixon-Coles low-score correction factor τ(x, y).
+
+    With rho < 0 this lifts 0-0 and 1-1 and damps 1-0 / 0-1, fixing the
+    independent-Poisson under-prediction of low-scoring draws. Scores with
+    x >= 2 or y >= 2 are left untouched (τ = 1).
     """
-    from scipy.stats import poisson
-    h = poisson.pmf(np.arange(MAX_GOALS + 1), lambda_home)
-    a = poisson.pmf(np.arange(MAX_GOALS + 1), lambda_away)
-    m = np.outer(h, a)
-    return m / m.sum()
+    if x == 0 and y == 0:
+        return 1.0 - lam * mu * rho
+    if x == 0 and y == 1:
+        return 1.0 + lam * rho
+    if x == 1 and y == 0:
+        return 1.0 + mu * rho
+    if x == 1 and y == 1:
+        return 1.0 - rho
+    return 1.0
+
+
+def _poisson_matrix(
+    lambda_home: float,
+    lambda_away: float,
+    rho: float = 0.0,
+    draw_boost: float = 1.0,
+) -> list[list[float]]:
+    """Bivariate Poisson score matrix with optional corrections.
+
+    rho = 0 and draw_boost = 1 reduce to the independent outer product of two
+    Poisson PMFs. rho applies the Dixon-Coles low-score factor; draw_boost
+    scales every i-i scoreline to lift the overall draw probability.
+    """
+    home_probs = _poisson_pmf(lambda_home)
+    away_probs = _poisson_pmf(lambda_away)
+    matrix = [[h * a for a in away_probs] for h in home_probs]
+    if rho:
+        for i in (0, 1):
+            for j in (0, 1):
+                tau = _dc_tau(i, j, lambda_home, lambda_away, rho)
+                # Guard against negative cells for extreme rho/lambda combos.
+                matrix[i][j] *= max(tau, 0.0)
+    if draw_boost != 1.0:
+        for i in range(len(matrix)):
+            matrix[i][i] *= draw_boost
+    total = sum(sum(row) for row in matrix)
+    return [[cell / total for cell in row] for row in matrix]
 
 
 def _matrix_to_prediction(
-    model: str, m: np.ndarray, lam_h: float, lam_a: float, notes: str = ""
+    model: str,
+    m: list[list[float]],
+    lam_h: float,
+    lam_a: float,
+    notes: str = "",
+    score_matrix: list[list[float]] | None = None,
 ) -> Prediction:
-    n = m.shape[0]
-    home_win = float(np.tril(m, -1).sum())   # rows > cols
-    away_win = float(np.triu(m, 1).sum())    # cols > rows
-    draw = float(np.diag(m).sum())
-    idx = np.unravel_index(np.argmax(m), m.shape)
+    """Build a Prediction.
+
+    W/D/L probabilities come from `m` (the draw-calibrated matrix). The single
+    most-likely scoreline and the displayed score grid come from `score_matrix`
+    when given (the raw, un-boosted distribution) so the headline scoreline keeps
+    its variety instead of collapsing onto 1-1. Falls back to `m` when omitted.
+    """
+    sm = score_matrix if score_matrix is not None else m
+    home_win = away_win = draw = 0.0
+    for i, row in enumerate(m):
+        for j, prob in enumerate(row):
+            if i > j:
+                home_win += prob
+            elif j > i:
+                away_win += prob
+            else:
+                draw += prob
+    best = (0, 0, -1.0)
+    for i, row in enumerate(sm):
+        for j, prob in enumerate(row):
+            if prob > best[2]:
+                best = (i, j, prob)
     return Prediction(
         model=model,  # type: ignore
         expected_home=lam_h,
@@ -88,8 +166,8 @@ def _matrix_to_prediction(
         p_home_win=home_win,
         p_draw=draw,
         p_away_win=away_win,
-        most_likely=(int(idx[0]), int(idx[1]), float(m[idx])),
-        score_matrix=m,
+        most_likely=best,
+        score_matrix=sm,
         notes=notes,
     )
 
@@ -113,20 +191,82 @@ AWAY_FEATURES = [
 ]
 
 
+def estimate_rho(
+    lams_h: list[float], lams_a: list[float], xs: list[int], ys: list[int]
+) -> float:
+    """1-D MLE of the Dixon-Coles rho on low-scoring training matches.
+
+    Only scores with both teams <= 1 carry information (τ = 1 elsewhere),
+    so the Poisson term drops out and we maximize Σ log τ over rho alone.
+    """
+    from scipy.optimize import minimize_scalar
+
+    def nll(rho: float) -> float:
+        s = 0.0
+        for lam, mu, x, y in zip(lams_h, lams_a, xs, ys):
+            if x <= 1 and y <= 1:
+                t = _dc_tau(int(x), int(y), lam, mu, rho)
+                if t <= 1e-9:
+                    return 1e12
+                s += math.log(t)
+        return -s
+
+    res = minimize_scalar(nll, bounds=(-0.3, 0.3), method="bounded")
+    return float(res.x)
+
+
 class HistoricalModel:
-    """Two independent Poisson GLMs: one for home goals, one for away goals."""
+    """Two independent Poisson GLMs (home/away goals) + Dixon-Coles rho.
+
+    Predictions are made venue-neutral by averaging both team orderings,
+    since the World Cup is played on neutral ground.
+    """
 
     def __init__(self):
-        self.model_home: sm.GLM | None = None
-        self.model_away: sm.GLM | None = None
+        self.model_home: Any | None = None
+        self.model_away: Any | None = None
+        self.rho: float = 0.0
 
-    def fit(self, df: pd.DataFrame) -> None:
+    def fit(self, df) -> None:
+        import statsmodels.api as sm
+
         X_h = sm.add_constant(df[HOME_FEATURES])
         X_a = sm.add_constant(df[AWAY_FEATURES])
         self.model_home = sm.GLM(df["home_goals"], X_h, family=sm.families.Poisson()).fit()
         self.model_away = sm.GLM(df["away_goals"], X_a, family=sm.families.Poisson()).fit()
+        # Dixon-Coles rho is left at 0 (independent Poisson). Estimating it on
+        # this data (estimate_rho, 822 internationals 2020-25) yields rho ~ +0.03,
+        # but the low-score cells deviate < 1σ from independence — i.e. not
+        # significant. For national teams the independent Poisson is already well
+        # calibrated, so we don't carry a parameter that fails a significance test.
+        # The DC machinery (estimate_rho, _dc_tau, _poisson_matrix's rho arg) stays
+        # available to re-check if the dataset grows.
+        self.rho = 0.0
+
+    @staticmethod
+    def _swap(f: MatchFeatures) -> MatchFeatures:
+        """Mirror a feature row so the two teams trade places."""
+        from dataclasses import replace
+
+        return replace(
+            f,
+            home_team_id=f.away_team_id,
+            away_team_id=f.home_team_id,
+            home_elo=f.away_elo,
+            away_elo=f.home_elo,
+            elo_diff=-f.elo_diff,
+            home_form_gf=f.away_form_gf,
+            home_form_ga=f.away_form_ga,
+            away_form_gf=f.home_form_gf,
+            away_form_ga=f.home_form_ga,
+            h2h_home_winrate=1.0 - f.h2h_home_winrate,
+            home_rest_days=f.away_rest_days,
+            away_rest_days=f.home_rest_days,
+        )
 
     def predict_lambdas(self, f: MatchFeatures) -> tuple[float, float]:
+        import pandas as pd
+
         if self.model_home is None or self.model_away is None:
             raise RuntimeError("Call fit() or load() first")
         x_h = pd.DataFrame([{
@@ -151,13 +291,23 @@ class HistoricalModel:
         )
 
     def predict(self, f: MatchFeatures) -> Prediction:
-        lam_h, lam_a = self.predict_lambdas(f)
-        m = _poisson_matrix(lam_h, lam_a)
-        return _matrix_to_prediction("historical", m, lam_h, lam_a)
+        # Venue-neutral: average each side's goals across both orderings.
+        lam_h1, lam_a1 = self.predict_lambdas(f)
+        lam_h2, lam_a2 = self.predict_lambdas(self._swap(f))
+        lam_h = 0.5 * (lam_h1 + lam_a2)
+        lam_a = 0.5 * (lam_a1 + lam_h2)
+        m_prob = _poisson_matrix(lam_h, lam_a, self.rho, DRAW_BOOST)
+        m_score = _poisson_matrix(lam_h, lam_a, self.rho, 1.0)
+        return _matrix_to_prediction(
+            "historical", m_prob, lam_h, lam_a, score_matrix=m_score
+        )
 
     def save(self, path: Path = MODEL_PATH / "historical.pkl") -> None:
         with open(path, "wb") as f:
-            pickle.dump({"home": self.model_home, "away": self.model_away}, f)
+            pickle.dump(
+                {"home": self.model_home, "away": self.model_away, "rho": self.rho},
+                f,
+            )
 
     @classmethod
     def load(cls, path: Path = MODEL_PATH / "historical.pkl") -> "HistoricalModel":
@@ -166,6 +316,7 @@ class HistoricalModel:
         m = cls()
         m.model_home = obj["home"]
         m.model_away = obj["away"]
+        m.rho = obj.get("rho", 0.0)
         return m
 
 
@@ -184,6 +335,8 @@ class BayesianPriorConfig:
     elo_baseline: float = 1500.0
     elo_scale: float = 400.0              # 400-Elo gap = 10x scoring ratio
     tournament_avg_goals: float = 1.35    # WC mean goals/team historically
+    rho: float = 0.0                      # Dixon-Coles off: not significant for NTs
+    draw_boost: float = DRAW_BOOST        # diagonal draw inflation (see DRAW_BOOST)
 
 
 class TournamentModel:
@@ -227,50 +380,79 @@ class TournamentModel:
         lam_h = (h_atk * a_def / avg) * home_advantage
         lam_a = (a_atk * h_def / avg)
 
-        m = _poisson_matrix(lam_h, lam_a)
+        m_prob = _poisson_matrix(lam_h, lam_a, self.config.rho, self.config.draw_boost)
+        m_score = _poisson_matrix(lam_h, lam_a, self.config.rho, 1.0)
         notes = (
             f"baseado em {home.matches_played} jogos do {home.team_code} "
             f"e {away.matches_played} do {away.team_code} na Copa 2026"
         )
-        return _matrix_to_prediction("tournament", m, lam_h, lam_a, notes)
+        features = [
+            FeatureRow("Elo pré-Copa", round(home.prior_elo), round(away.prior_elo)),
+            FeatureRow("Jogos na Copa", home.matches_played, away.matches_played),
+            FeatureRow(
+                "Gols marcados (Copa)",
+                home.goals_scored_total, away.goals_scored_total,
+            ),
+            FeatureRow(
+                "Gols sofridos (Copa)",
+                home.goals_conceded_total, away.goals_conceded_total,
+            ),
+            FeatureRow("Ataque estimado", round(h_atk, 2), round(a_atk, 2)),
+            FeatureRow("Defesa estimada", round(h_def, 2), round(a_def, 2)),
+        ]
+        pred = _matrix_to_prediction(
+            "tournament", m_prob, lam_h, lam_a, notes, score_matrix=m_score
+        )
+        pred.features = features
+        return pred
 
 
 # ======================================================================
 # CLI: train / inspect
 # ======================================================================
-@click.group()
-def cli():
-    """Model training and inspection."""
-
-
-@cli.command("train-historical")
-@click.option("--since", default="2020-01-01")
-def train_historical(since: str):
+def train_historical(since: str = "2020-01-01"):
     """Train Modelo A on historical international matches."""
-    click.echo("Building training set...")
+    from .features import build_training_set
+
+    print("Building training set...")
     df = build_training_set(since=since)
-    click.echo(f"  {len(df)} matches")
-    click.echo("Fitting Poisson GLMs...")
+    print(f"  {len(df)} matches")
+    print("Fitting Poisson GLMs...")
     m = HistoricalModel()
     m.fit(df)
     m.save()
-    click.echo("✓ Saved to models_artifacts/historical.pkl")
-    click.echo("\nHome goals model summary:")
-    click.echo(m.model_home.summary().tables[1])
+    print("Saved to models_artifacts/historical.pkl")
+    print("\nHome goals model summary:")
+    print(m.model_home.summary().tables[1])
 
 
-@cli.command("inspect-tournament")
 def inspect_tournament():
     """Print current tournament state per team."""
     state = build_tournament_state()
     for s in sorted(state.values(), key=lambda x: -x.matches_played):
         if s.matches_played == 0:
             continue
-        click.echo(
+        print(
             f"{s.team_code:>3} | played={s.matches_played} "
             f"GF={s.goals_scored_total} GA={s.goals_conceded_total} "
             f"prior_elo={s.prior_elo:.0f}"
         )
+
+
+def cli():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Model training and inspection.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    train_parser = subparsers.add_parser("train-historical")
+    train_parser.add_argument("--since", default="2020-01-01")
+    subparsers.add_parser("inspect-tournament")
+    args = parser.parse_args()
+
+    if args.command == "train-historical":
+        train_historical(since=args.since)
+    elif args.command == "inspect-tournament":
+        inspect_tournament()
 
 
 if __name__ == "__main__":

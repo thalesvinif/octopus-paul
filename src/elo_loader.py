@@ -12,21 +12,52 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
-
-import pandas as pd
+import unicodedata
 
 DB_PATH = os.getenv("DB_PATH", "./copa.db")
 
 
+def _norm_name(value: str) -> str:
+    value = unicodedata.normalize("NFKD", str(value))
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    return value.casefold().replace("&", "and").strip()
+
+
+def _team_code_map(db_path: str) -> dict[str, str]:
+    """Return normalized team/country names mapped to API-Football team codes."""
+    try:
+        with sqlite3.connect(db_path) as con:
+            rows = con.execute(
+                """SELECT name, country, code FROM teams
+                   WHERE code IS NOT NULL AND code != ''"""
+            ).fetchall()
+    except sqlite3.Error:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for name, country, code in rows:
+        if name:
+            mapping[_norm_name(name)] = code
+        if country:
+            mapping[_norm_name(country)] = code
+    return mapping
+
+
 def load_elo_csv(csv_path: str | Path, db_path: str = DB_PATH) -> int:
     """Load an Elo CSV into the elo_ratings table. Returns row count loaded."""
+    import pandas as pd
+
     df = pd.read_csv(csv_path)
     # Normalize column names
     df.columns = [c.lower() for c in df.columns]
 
     # Pick the canonical columns we care about; the Kaggle dataset uses
     # 'end_of_year_elo' as the rating field and 'code' for the 3-letter code.
-    code_col = "code" if "code" in df.columns else "team_code"
+    code_col = next(
+        (c for c in ("code", "team_code", "country_code") if c in df.columns), None
+    )
+    if code_col is None:
+        raise ValueError(f"No team code column found. Available: {list(df.columns)}")
     elo_col = next(
         (c for c in ("end_of_year_elo", "elo", "rating") if c in df.columns), None
     )
@@ -41,6 +72,16 @@ def load_elo_csv(csv_path: str | Path, db_path: str = DB_PATH) -> int:
 
     out = df[[code_col, "snapshot_date", elo_col] + ([rank_col] if rank_col else [])].copy()
     out.columns = ["team_code", "snapshot_date", "elo"] + (["rank"] if rank_col else [])
+
+    if "country" in df.columns:
+        api_codes = _team_code_map(db_path)
+        if api_codes:
+            countries = df.loc[out.index, "country"].map(_norm_name)
+            out["team_code"] = [
+                api_codes.get(country, fallback)
+                for country, fallback in zip(countries, out["team_code"])
+            ]
+
     out = out.dropna(subset=["team_code", "elo"])
 
     with sqlite3.connect(db_path) as con:
